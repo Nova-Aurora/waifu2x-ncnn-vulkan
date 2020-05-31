@@ -17,10 +17,12 @@
 #define STBI_NO_GIF
 #define STBI_NO_HDR
 #define STBI_NO_PIC
+#define STBI_NO_STDIO
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #endif // _WIN32
+#include "webp_image.h"
 
 #if _WIN32
 #include <wchar.h>
@@ -69,21 +71,23 @@ static void print_usage()
     fprintf(stderr, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n\n");
     fprintf(stderr, "  -h                   show this help\n");
     fprintf(stderr, "  -v                   verbose output\n");
-    fprintf(stderr, "  -i input-path        input image path (jpg/png) or directory\n");
-    fprintf(stderr, "  -o output-path       output image path (png) or directory\n");
+    fprintf(stderr, "  -i input-path        input image path (jpg/png/webp) or directory\n");
+    fprintf(stderr, "  -o output-path       output image path (png/webp) or directory\n");
     fprintf(stderr, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stderr, "  -s scale             upscale ratio (1/2, default=2)\n");
-    fprintf(stderr, "  -t tile-size         tile size (>=32, default=400)\n");
+    fprintf(stderr, "  -t tile-size         tile size (>=32/0=auto, default=0)\n");
     fprintf(stderr, "  -m model-path        waifu2x model path (default=models-cunet)\n");
     fprintf(stderr, "  -g gpu-id            gpu device to use (default=0)\n");
     fprintf(stderr, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2)\n");
     fprintf(stderr, "  -x                   enable tta mode\n");
+    fprintf(stderr, "  -f format            output image format (png/webp, default=ext/png)\n");
 }
 
 class Task
 {
 public:
     int id;
+    int webp;
 
     path_t inpath;
     path_t outpath;
@@ -163,25 +167,81 @@ void* load(void* args)
     {
         const path_t& imagepath = ltp->input_files[i];
 
+        int webp = 0;
+
         unsigned char* pixeldata = 0;
         int w;
         int h;
         int c;
 
 #if _WIN32
-        pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
+        FILE* fp = _wfopen(imagepath.c_str(), L"rb");
+#else
+        FILE* fp = fopen(imagepath.c_str(), "rb");
+#endif
+        if (fp)
+        {
+            // read whole file
+            unsigned char* filedata = 0;
+            int length = 0;
+            {
+                fseek(fp, 0, SEEK_END);
+                length = ftell(fp);
+                rewind(fp);
+                filedata = (unsigned char*)malloc(length);
+                if (filedata)
+                {
+                    fread(filedata, 1, length, fp);
+                }
+                fclose(fp);
+            }
+
+            if (filedata)
+            {
+                pixeldata = webp_load(filedata, length, &w, &h, &c);
+                if (pixeldata)
+                {
+                    webp = 1;
+                }
+                else
+                {
+                    // not webp, try jpg png etc.
+#if _WIN32
+                    pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
 #else // _WIN32
-        pixeldata = stbi_load(imagepath.c_str(), &w, &h, &c, 3);
+                    pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
+                    if (pixeldata)
+                    {
+                        // stb_image auto channel
+                        if (c == 1)
+                        {
+                            // grayscale -> rgb
+                            stbi_image_free(pixeldata);
+                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 3);
+                        }
+                        else if (c == 2)
+                        {
+                            // grayscale + alpha -> rgba
+                            stbi_image_free(pixeldata);
+                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 4);
+                        }
+                    }
 #endif // _WIN32
+                }
+
+                free(filedata);
+            }
+        }
         if (pixeldata)
         {
             Task v;
             v.id = i;
+            v.webp = webp;
             v.inpath = imagepath;
             v.outpath = ltp->output_files[i];
 
-            v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)3, 3);
-            v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)3u, 3);
+            v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+            v.outimage = ncnn::Mat(w * scale, h * scale, (size_t)c, c);
 
             toproc.put(v);
         }
@@ -249,18 +309,36 @@ void* save(void* args)
         // free input pixel data
         {
             unsigned char* pixeldata = (unsigned char*)v.inimage.data;
+            if (v.webp == 1)
+            {
+                free(pixeldata);
+            }
+            else
+            {
 #if _WIN32
-            free(pixeldata);
+                free(pixeldata);
 #else
-            stbi_image_free(pixeldata);
+                stbi_image_free(pixeldata);
 #endif
+            }
         }
 
+        int success = 0;
+
+        path_t ext = get_file_extension(v.outpath);
+
+        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        {
+            success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, (const unsigned char*)v.outimage.data);
+        }
+        else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+        {
 #if _WIN32
-        int success = wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, 3, v.outimage.data);
+            success = wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
 #else
-        int success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, 3, v.outimage.data, 0);
+            success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 0);
 #endif
+        }
         if (success)
         {
             if (verbose)
@@ -296,7 +374,7 @@ int main(int argc, char** argv)
     path_t outputpath;
     int noise = 0;
     int scale = 2;
-    int tilesize = 400;
+    int tilesize = 0;
     path_t model = PATHSTR("models-cunet");
     int gpuid = 0;
     int jobs_load = 1;
@@ -304,11 +382,12 @@ int main(int argc, char** argv)
     int jobs_save = 2;
     int verbose = 0;
     int tta_mode = 0;
+    path_t format = PATHSTR("png");
 
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:vxh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
     {
         switch (opt)
         {
@@ -336,6 +415,9 @@ int main(int argc, char** argv)
         case L'j':
             swscanf(optarg, L"%d:%d:%d", &jobs_load, &jobs_proc, &jobs_save);
             break;
+        case L'f':
+            format = optarg;
+            break;
         case L'v':
             verbose = 1;
             break;
@@ -350,7 +432,7 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:vxh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
     {
         switch (opt)
         {
@@ -377,6 +459,9 @@ int main(int argc, char** argv)
             break;
         case 'j':
             sscanf(optarg, "%d:%d:%d", &jobs_load, &jobs_proc, &jobs_save);
+            break;
+        case 'f':
+            format = optarg;
             break;
         case 'v':
             verbose = 1;
@@ -410,13 +495,7 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    if ((noise == -1 && scale == 1))
-    {
-        fprintf(stderr, "invalid noise or scale argument\n");
-        return -1;
-    }
-
-    if (tilesize < 32)
+    if (tilesize != 0 && tilesize < 32)
     {
         fprintf(stderr, "invalid tilesize argument\n");
         return -1;
@@ -425,6 +504,32 @@ int main(int argc, char** argv)
     if (jobs_load < 1 || jobs_proc < 1 || jobs_save < 1)
     {
         fprintf(stderr, "invalid thread count argument\n");
+        return -1;
+    }
+
+    if (!path_is_directory(outputpath))
+    {
+        // guess format from outputpath no matter what format argument specified
+        path_t ext = get_file_extension(outputpath);
+
+        if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+        {
+            format = PATHSTR("png");
+        }
+        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        {
+            format = PATHSTR("webp");
+        }
+        else
+        {
+            fprintf(stderr, "invalid outputpath extension type\n");
+            return -1;
+        }
+    }
+
+    if (format != PATHSTR("png") && format != PATHSTR("webp"))
+    {
+        fprintf(stderr, "invalid format argument\n");
         return -1;
     }
 
@@ -445,7 +550,7 @@ int main(int argc, char** argv)
             for (int i=0; i<count; i++)
             {
                 input_files[i] = inputpath + PATHSTR('/') + filenames[i];
-                output_files[i] = outputpath + PATHSTR('/') + filenames[i] + PATHSTR(".png");
+                output_files[i] = outputpath + PATHSTR('/') + filenames[i] + PATHSTR('.') + format;
             }
         }
         else if (!path_is_directory(inputpath) && !path_is_directory(outputpath))
@@ -550,6 +655,36 @@ int main(int argc, char** argv)
 
     int gpu_queue_count = ncnn::get_gpu_info(gpuid).compute_queue_count;
     jobs_proc = std::min(jobs_proc, gpu_queue_count);
+
+    if (tilesize == 0)
+    {
+        uint32_t heap_budget = ncnn::get_gpu_device(gpuid)->get_heap_budget();
+
+        // more fine-grained tilesize policy here
+        if (model.find(PATHSTR("models-cunet")) != path_t::npos)
+        {
+            if (heap_budget > 2600)
+                tilesize = 400;
+            else if (heap_budget > 740)
+                tilesize = 200;
+            else if (heap_budget > 250)
+                tilesize = 100;
+            else
+                tilesize = 32;
+        }
+        else if (model.find(PATHSTR("models-upconv_7_anime_style_art_rgb")) != path_t::npos
+            || model.find(PATHSTR("models-upconv_7_photo")) != path_t::npos)
+        {
+            if (heap_budget > 1900)
+                tilesize = 400;
+            else if (heap_budget > 550)
+                tilesize = 200;
+            else if (heap_budget > 190)
+                tilesize = 100;
+            else
+                tilesize = 32;
+        }
+    }
 
     {
         Waifu2x waifu2x(gpuid, tta_mode);
